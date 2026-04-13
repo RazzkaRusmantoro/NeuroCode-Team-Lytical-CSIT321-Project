@@ -17,6 +17,8 @@ Watch the demo on YouTube: https://www.youtube.com/watch?v=0nnDuntck44
 ## Disclaimer
 
 > **Important:** Run this project as Administrator!
+>
+> If you cannot run the repo locally, you can also visit `neurocode.lol` instead.
 
 ## Prerequisites
 
