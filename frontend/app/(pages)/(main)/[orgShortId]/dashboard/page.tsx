@@ -38,5 +38,6 @@ export default async function DashboardPage({ params, }: {
         lastUpdate: r.lastUpdate ? new Date(r.lastUpdate).toISOString() : null,
         source: (r.source as string) || 'github',
     }));
-    return (<DashboardClient userName={session.user.name || user.name || 'there'} orgSegment={orgSegment} orgName={userOrg.name || organization.shortId} repos={repos}/>);
+    const userDisplayName = `${user.firstName} ${user.lastName}`.trim() || user.email;
+    return (<DashboardClient userName={(session.user.name ?? userDisplayName) || 'there'} orgSegment={orgSegment} orgName={userOrg.name || organization.shortId} repos={repos}/>);
 }

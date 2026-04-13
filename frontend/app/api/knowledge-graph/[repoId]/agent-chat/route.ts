@@ -23,7 +23,6 @@ export async function POST(req: NextRequest, { params }: {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(enrichedBody),
-            duplex: 'half',
         });
         if (!upstream.ok) {
             const err = await upstream.json().catch(() => ({}));
