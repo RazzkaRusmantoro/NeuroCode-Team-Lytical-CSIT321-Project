@@ -1,4 +1,4 @@
-# NeuroCode Team Lytical CSIT321 Project
+# NeuroCode
 
 ## Project Overview
 
