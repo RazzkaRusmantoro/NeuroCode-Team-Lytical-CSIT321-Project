@@ -1,0 +1,39 @@
+'use client';
+import { useState } from 'react';
+import VisualTreeCanvas from './VisualTreeCanvas';
+import DocumentationHeader from './DocumentationHeader';
+import GenerateDocumentationModal from './GenerateDocumentationModal';
+interface VisualTreeViewerProps {
+    repositoryId: string;
+    repoFullName: string;
+    orgShortId: string;
+    repoUrlName: string;
+    repoName: string;
+}
+export default function VisualTreeViewer({ repositoryId, repoFullName, orgShortId, repoUrlName, repoName, }: VisualTreeViewerProps) {
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const handleGenerateDocumentation = () => {
+        setIsModalOpen(true);
+    };
+    const handleCloseModal = () => {
+        setIsModalOpen(false);
+    };
+    return (<>
+      <div className="h-full flex flex-col bg-transparent">
+        <div className="max-w-screen-2xl mx-auto w-full h-full flex flex-col">
+          
+          <div className="flex-1 overflow-y-auto custom-scrollbar px-6 py-6">
+            
+            <DocumentationHeader activeTab="visual-tree" searchQuery="" onSearchChange={undefined} onGenerateClick={handleGenerateDocumentation}/>
+
+            
+            <div className="mt-12">
+              <VisualTreeCanvas repositoryId={repositoryId} repoFullName={repoFullName} orgShortId={orgShortId} repoUrlName={repoUrlName} repoName={repoName}/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <GenerateDocumentationModal isOpen={isModalOpen} onClose={handleCloseModal} repoName={repoName} repoFullName={repoFullName} orgShortId={orgShortId} repoUrlName={repoUrlName} repositoryId={repositoryId}/>
+    </>);
+}
