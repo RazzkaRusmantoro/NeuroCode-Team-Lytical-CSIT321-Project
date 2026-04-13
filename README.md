@@ -1,5 +1,3 @@
-# NeuroCode
-
 ![NeuroCode Full Logo](./frontend/public/Full-logo.png)
 
 ## Project Overview
