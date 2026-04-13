@@ -2,7 +2,13 @@
 
 ## Project Overview
 
-**NeuroCode** connects to your team’s repositories and turns a live codebase into something you can navigate, explain, and onboard onto without reading every file: structural maps of how components relate, documentation and guided paths tied to the actual tree, and workflows that highlight risky or high-churn areas. Under the hood it is built as **retrieval-augmented generation (RAG)**: source is **chunked**, **embedded** with transformer-style models, indexed in a **vector database** for similarity search, and only then passed to **LLMs** as retrieved context—so answers, docs, and assistants are grounded in your repo, not generic model priors. That semantic layer sits alongside **deterministic code analysis** (parse trees, dependency and symbol structure) and a **knowledge-graph** view of the system, so the product combines **structured graph signals + vector retrieval + probabilistic generation**. **The goal** is faster ramp-up, less stale institutional knowledge, and a shared picture of how the system works for everyone who ships code.
+**NeuroCode** connects to your team’s repositories and turns a live codebase into a navigable system. It helps you explain and onboard without reading every file. It provides structural maps of component relationships, documentation and guided paths tied to the actual tree, and workflows that highlight risky or high-churn areas.
+
+The backend uses **retrieval-augmented generation (RAG)**. Source files are **chunked**, **embedded** with transformer-style models, indexed in a **vector database** for similarity search, and then passed to **LLMs** as retrieved context. This keeps answers, docs, and assistants grounded in your repo rather than generic model priors.
+
+The system also uses **deterministic code analysis** (parse trees, dependency and symbol structure) and a **knowledge graph** view of the system. The product combines **structured graph signals**, **vector retrieval**, and **probabilistic generation**.
+
+**The goal** is faster ramp-up, less stale institutional knowledge, and a shared picture of how the system works for everyone who ships code.
 
 [![YouTube Demo Video](https://img.youtube.com/vi/0nnDuntck44/0.jpg)](https://www.youtube.com/watch?v=0nnDuntck44)
  
