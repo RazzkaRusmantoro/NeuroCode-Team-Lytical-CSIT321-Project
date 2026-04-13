@@ -1,0 +1,1802 @@
+from fastapi import APIRouter, HTTPException
+from typing import Optional, List, Dict, Any
+import re
+import json
+from datetime import datetime
+
+from neurocode.models.schemas import (
+    GenerateDocumentationRequest,
+    GenerateDocsRAGRequest,
+    GetDocumentationRequest,
+    GenerateUmlRequest,
+)
+from neurocode.config import (
+    github_fetcher,
+    storage_service,
+    vectorizer,
+    llm_service,
+    s3_service,
+    mongodb_service,
+)
+from neurocode.services.index_pipeline import run_index_pipeline, build_collection_name
+from neurocode.services.agent_docs_validation import validate_agent_docs_bundle
+from neurocode.models.agent_docs import AgentDocsBundle
+
+router = APIRouter()
+
+
+ARCH_DIAGRAM_EXCLUDE = {
+    "deployment and runtime",
+    "deployment & runtime",
+    "design decisions and conventions",
+    "design decisions & conventions",
+    "external dependencies",
+    "data flow and communication",
+    "data flow & communication",
+    "overview",
+}
+
+
+ARCH_DIAGRAM_CLASS_SECTION = {"components"}
+
+
+def _normalize_section_title_for_diagram(title: str) -> str:
+    if not title:
+        return ""
+    return " ".join(title.lower().strip().split())
+
+
+def _should_generate_diagram_for_section(title: str) -> bool:
+    normalized = _normalize_section_title_for_diagram(title)
+    return normalized not in ARCH_DIAGRAM_EXCLUDE
+
+
+def _is_components_section(title: str) -> bool:
+    return _normalize_section_title_for_diagram(title) in ARCH_DIAGRAM_CLASS_SECTION
+
+
+def _enrich_architecture_diagrams(
+    documentation: Dict[str, Any],
+    llm_service,
+    context_chunks: Optional[List[Dict[str, Any]]] = None,
+    repo_name: Optional[str] = None,
+) -> None:
+
+    sections = documentation.get("sections") or []
+    for section in sections:
+        title = section.get("title") or ""
+        if not _should_generate_diagram_for_section(title):
+            section["diagram"] = None
+            section["diagramType"] = None
+        elif _is_components_section(title) and context_chunks and repo_name:
+            try:
+                uml_result = llm_service.generate_uml_class_diagram(
+                    prompt="Generate a class diagram of the main components and their relationships.",
+                    context_chunks=context_chunks,
+                    repo_name=repo_name,
+                )
+                if uml_result.get("error"):
+                    print(
+                        f"[Documentation] Class diagram for Components failed: {uml_result.get('error')}"
+                    )
+                    section["diagram"] = None
+                    section["diagramType"] = None
+                else:
+                    section["diagramType"] = "class"
+                    section["diagram"] = {
+                        "classes": uml_result.get("classes") or [],
+                        "relationships": uml_result.get("relationships") or [],
+                    }
+            except Exception as e:
+                print(
+                    f"[Documentation] Skipping class diagram for section '{title}': {e}"
+                )
+                section["diagram"] = None
+                section["diagramType"] = None
+        else:
+            try:
+                desc = section.get("description") or ""
+                diagram = llm_service.generate_section_flowchart(
+                    section_title=title, section_description=desc
+                )
+                section["diagram"] = diagram
+                section["diagramType"] = "flowchart"
+            except Exception as e:
+                print(f"[Documentation] Skipping diagram for section '{title}': {e}")
+                section["diagram"] = None
+                section["diagramType"] = None
+        for subsection in section.get("subsections") or []:
+            sub_title = subsection.get("title") or ""
+            if not _should_generate_diagram_for_section(sub_title):
+                subsection["diagram"] = None
+                subsection["diagramType"] = None
+            elif _is_components_section(sub_title) and context_chunks and repo_name:
+                try:
+                    uml_result = llm_service.generate_uml_class_diagram(
+                        prompt="Generate a class diagram of the main components and their relationships.",
+                        context_chunks=context_chunks,
+                        repo_name=repo_name,
+                    )
+                    if uml_result.get("error"):
+                        subsection["diagram"] = None
+                        subsection["diagramType"] = None
+                    else:
+                        subsection["diagramType"] = "class"
+                        subsection["diagram"] = {
+                            "classes": uml_result.get("classes") or [],
+                            "relationships": uml_result.get("relationships") or [],
+                        }
+                except Exception as e:
+                    subsection["diagram"] = None
+                    subsection["diagramType"] = None
+            else:
+                try:
+                    sub_desc = subsection.get("description") or ""
+                    diagram = llm_service.generate_section_flowchart(
+                        section_title=sub_title, section_description=sub_desc
+                    )
+                    subsection["diagram"] = diagram
+                    subsection["diagramType"] = "flowchart"
+                except Exception as e:
+                    subsection["diagram"] = None
+                    subsection["diagramType"] = None
+
+
+def _agent_bundle_to_documentation(bundle: AgentDocsBundle) -> Dict[str, Any]:
+
+    guide = bundle.guide
+
+    def _frontmatter_block(role: Optional[str], context: Optional[str]) -> str:
+        lines: List[str] = ["----"]
+        if role:
+            lines.append(f"role: {role}")
+        if context:
+            lines.append(f"context: {context}")
+        lines.append("----")
+        return "\n".join(lines)
+
+    sections: List[Dict[str, Any]] = []
+
+    guide_role = "Main AI guide for this repository (load this first)."
+    guide_context = guide.when_to_use.strip()
+
+    guide_lines: List[str] = []
+    guide_lines.append(_frontmatter_block(guide_role, guide_context))
+    guide_lines.append("")
+    guide_lines.append("# GUIDE")
+    guide_lines.append("")
+    guide_lines.append("## What this is for")
+    guide_lines.append("")
+    guide_lines.append(guide.description.strip())
+    guide_lines.append("")
+    guide_lines.append("## When to use")
+    guide_lines.append("")
+    guide_lines.append(guide.when_to_use.strip())
+    guide_lines.append("")
+
+    if guide.topic_pointers:
+        guide_lines.append("## Topic pointers")
+        guide_lines.append("")
+        for ptr in guide.topic_pointers:
+            guide_lines.append(f"### {ptr.title}")
+            guide_lines.append("")
+            guide_lines.append(ptr.body.strip())
+            guide_lines.append("")
+            guide_lines.append(f"Reference rule file: `{ptr.rule_path}`")
+            guide_lines.append("")
+
+    guide_lines.append("## How to use")
+    guide_lines.append("")
+    for item in guide.how_to_use:
+        guide_lines.append(f"- `{item.path}` – {item.description}")
+
+    guide_md_content = "\n".join(guide_lines).strip()
+    guide_md_code_block = f"```md\n{guide_md_content}\n```"
+
+    sections.append(
+        {
+            "id": "1",
+            "title": "GUIDE.md",
+            "description": guide_md_code_block,
+            "code_references": [],
+            "subsections": [],
+        }
+    )
+
+    for idx, rule in enumerate(bundle.rules, start=2):
+        rule_role = rule.role or f"Rule for {rule.name}"
+        rule_context = rule.description.strip()
+
+        rule_lines: List[str] = []
+        rule_lines.append(_frontmatter_block(rule_role, rule_context))
+        rule_lines.append("")
+        rule_lines.append(f"# {rule.name.replace('-', ' ').title()}")
+        rule_lines.append("")
+
+        if rule.prerequisites:
+            rule_lines.append("## Prerequisites")
+            rule_lines.append("")
+            for p in rule.prerequisites:
+                rule_lines.append(f"- {p}")
+            rule_lines.append("")
+
+        rule_lines.append(rule.body.strip())
+
+        if rule.input:
+            rule_lines.append("")
+            rule_lines.append("## Input")
+            rule_lines.append("")
+            rule_lines.append(rule.input.strip())
+
+        if rule.output:
+            rule_lines.append("")
+            rule_lines.append("## Output")
+            rule_lines.append("")
+            rule_lines.append(rule.output.strip())
+
+        rule_md_content = "\n".join(rule_lines).strip()
+        rule_md_code_block = f"```md\n{rule_md_content}\n```"
+
+        sections.append(
+            {
+                "id": str(idx),
+                "title": f"{rule.name}.md",
+                "description": rule_md_code_block,
+                "code_references": [],
+                "subsections": [],
+            }
+        )
+
+    return {
+        "description": guide.description,
+        "sections": sections,
+    }
+
+
+def _get_other_repo_chunks(
+    target_collection_name: str,
+    org_short_id: str,
+    query: str,
+    chunks_per_repo: int = 5,
+) -> List[Dict[str, Any]]:
+
+    if not vectorizer or not (org_short_id or "").strip():
+        return []
+    org_short_id = (org_short_id or "").strip()
+    try:
+        all_collections = vectorizer.vector_db.list_collections_by_org_short_id(
+            org_short_id
+        )
+    except Exception:
+        return []
+    other_collections = [c for c in all_collections if c != target_collection_name]
+    if not other_collections:
+        return []
+    extra: List[Dict[str, Any]] = []
+    for coll in other_collections:
+        try:
+            if vectorizer.vector_db.get_collection_count(coll) <= 0:
+                continue
+            results = vectorizer.search(
+                collection_name=coll,
+                query=query,
+                top_k=chunks_per_repo,
+            )
+            for r in results:
+                r["_collection"] = coll
+            extra.extend(results)
+        except Exception:
+            continue
+    return extra
+
+
+@router.post("/api/generate-documentation")
+async def generate_documentation(request: GenerateDocumentationRequest):
+
+    try:
+        print("\n" + "=" * 60)
+        print("DOCUMENTATION GENERATION PIPELINE")
+        print("=" * 60)
+        print(f"Repository: {request.repo_full_name}")
+        print(f"Branch: {request.branch}")
+        print(f"Scope: {request.scope}")
+        print(f"Target: {request.target or 'N/A'}")
+        print("=" * 60)
+        result = await run_index_pipeline(
+            github_token=request.github_token,
+            repo_full_name=request.repo_full_name,
+            branch=request.branch or "main",
+            target=request.target,
+            organization_id=request.organization_id,
+            organization_short_id=request.organization_short_id,
+            organization_name=request.organization_name,
+            repository_id=request.repository_id,
+            repository_name=request.repository_name,
+        )
+        if not result.get("success"):
+            return result
+        result["scope"] = request.scope
+        result["target"] = request.target
+        result["message"] = "Analysis complete. Results saved locally and vectorized."
+        print("=" * 60 + "\n")
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"\n[ERROR] Failed to generate documentation: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate documentation: {str(e)}"
+        )
+
+
+@router.post("/api/generate-docs-rag")
+async def generate_docs_rag(request: GenerateDocsRAGRequest):
+
+    try:
+        if not llm_service:
+            raise HTTPException(
+                status_code=500,
+                detail="LLM service not available. Please set ANTHROPIC_API_KEY environment variable.",
+            )
+
+        print("\n" + "=" * 60)
+        print("RAG DOCUMENTATION GENERATION (FULL PIPELINE)")
+        print("=" * 60)
+        print(f"Repository: {request.repo_full_name}")
+        print(f"Branch: {request.branch or 'main'}")
+        print(f"Prompt: {request.prompt}")
+        print("=" * 60)
+
+        if not request.organization_short_id or not request.repository_name:
+            raise HTTPException(
+                status_code=400,
+                detail="organization_short_id and repository_name are required for collection naming",
+            )
+
+        branch = request.branch or "main"
+        if not branch.strip() or branch.strip().lower() in ("main", "master"):
+            resolved = await github_fetcher.get_default_branch(
+                request.repo_full_name, request.github_token
+            )
+            if resolved:
+                branch = resolved
+                print(f"[generate-docs-rag] Using repo default branch: {branch}")
+
+        collection_name = build_collection_name(
+            request.organization_name,
+            request.organization_short_id,
+            request.repository_name,
+            branch,
+        )
+        existing_count = vectorizer.vector_db.get_collection_count(collection_name)
+
+        if existing_count > 0:
+
+            print(
+                f"\n[Skip] Collection '{collection_name}' exists ({existing_count} chunks). Retrieving only."
+            )
+            result = {
+                "success": True,
+                "branch": branch,
+                "metadata": {
+                    "totalChunks": existing_count,
+                    "totalFiles": 0,
+                    "totalFunctions": 0,
+                    "totalClasses": 0,
+                    "languages": [],
+                    "parseErrors": 0,
+                },
+                "vectorization": {
+                    "success": True,
+                    "collection_name": collection_name,
+                },
+            }
+        else:
+
+            result = await run_index_pipeline(
+                github_token=request.github_token,
+                repo_full_name=request.repo_full_name,
+                branch=request.branch or "main",
+                target=None,
+                organization_id=request.organization_id,
+                organization_short_id=request.organization_short_id,
+                organization_name=request.organization_name,
+                repository_id=request.repository_id,
+                repository_name=request.repository_name,
+            )
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=(
+                        400
+                        if "required" in str(result.get("message", "")).lower()
+                        else 500
+                    ),
+                    detail=result.get("message", "Index pipeline failed"),
+                )
+            vectorization = result.get("vectorization")
+            if not vectorization or not vectorization.get("success"):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Index pipeline completed but vectorization failed.",
+                )
+            collection_name = vectorization["collection_name"]
+            branch = result.get("branch", request.branch or "main")
+
+        index_metadata = result.get("metadata", {})
+
+        print(f"\n[Step 6/10] Searching vector DB for relevant chunks...")
+        print(f"Query: {request.prompt}")
+
+        search_results = vectorizer.search(
+            collection_name=collection_name,
+            query=request.prompt,
+            top_k=request.top_k or 20,
+        )
+
+        if not search_results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No chunks found in collection '{collection_name}'",
+            )
+
+        other_chunks = _get_other_repo_chunks(
+            target_collection_name=collection_name,
+            org_short_id=request.organization_short_id or "",
+            query=request.prompt,
+            chunks_per_repo=5,
+        )
+        if other_chunks:
+            search_results = search_results + other_chunks
+            print(
+                f"✓ Found {len(search_results) - len(other_chunks)} from target repo + {len(other_chunks)} from other repos"
+            )
+        else:
+            print(f"✓ Found {len(search_results)} relevant chunks")
+
+        _file_paths = sorted(
+            set(
+                (c.get("metadata") or {}).get("file_path", "").strip()
+                for c in search_results
+            )
+        )
+        file_paths = [p for p in _file_paths if p]
+
+        documentation = None
+        code_reference_ids_from_llm = []
+        code_reference_details = []
+        arch_result = None
+
+        if (
+            request.documentation_type == "aiAgent"
+            and (request.ai_agent_doc_kind or "") == "custom"
+        ):
+            print(
+                f"\n[Step 7/10] Generating AI-Agent docs bundle (guide + rules) with Claude..."
+            )
+            raw_bundle = llm_service.generate_agent_docs_bundle(
+                prompt=request.prompt,
+                context_chunks=search_results,
+                repo_name=request.repository_name or request.repo_full_name,
+                extra_instructions=(request.ai_agent_extra_instructions or "").strip(),
+            )
+            if raw_bundle.get("error"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"AI-Agent bundle generation failed: {raw_bundle.get('error')}",
+                )
+            ok, bundle, err = validate_agent_docs_bundle(raw_bundle)
+            if not ok or bundle is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"AI-Agent bundle validation failed: {err}",
+                )
+            documentation = _agent_bundle_to_documentation(bundle)
+            code_reference_ids_from_llm = []
+            code_reference_details = []
+            print(f"✓ Generated guide + {len(bundle.rules)} rules")
+        elif request.documentation_type == "architecture":
+            print(
+                f"\n[Step 7/10] Generating System Architecture documentation with Claude..."
+            )
+            arch_result = llm_service.generate_architecture_documentation(
+                prompt=request.prompt,
+                context_chunks=search_results,
+                repo_name=request.repository_name or request.repo_full_name,
+            )
+            documentation = {
+                "description": arch_result.get("description", "").strip(),
+                "sections": arch_result.get("sections", []),
+            }
+            code_reference_ids_from_llm = []
+            code_reference_details = []
+            print(
+                f"✓ Generated System Architecture documentation ({len(documentation['sections'])} sections)"
+            )
+        else:
+            print(f"\n[Step 7/10] Generating structured documentation with Claude...")
+            structured_result = llm_service.generate_structured_documentation(
+                prompt=request.prompt,
+                context_chunks=search_results,
+                repo_name=request.repository_name or request.repo_full_name,
+            )
+            documentation = structured_result.get("documentation", {"sections": []})
+            code_reference_ids_from_llm = structured_result.get(
+                "code_reference_ids", []
+            )
+
+        if len(code_reference_ids_from_llm) > 15:
+            print(
+                f"  ⚠ Warning: {len(code_reference_ids_from_llm)} code references found, limiting to 15"
+            )
+            code_reference_ids_from_llm = code_reference_ids_from_llm[:15]
+
+        code_reference_details = []
+
+        for ref_id in code_reference_ids_from_llm:
+            matched = False
+            for chunk in search_results:
+                metadata = chunk.get("metadata", {})
+                function_name = metadata.get("function_name", "")
+                class_name = metadata.get("class_name", "")
+                method_name = metadata.get("method_name", "")
+                file_path = metadata.get("file_path", "")
+                content = chunk.get("content", "")
+
+                matched_name = None
+                ref_type = None
+
+                if function_name and (
+                    ref_id.lower() == function_name.lower()
+                    or ref_id.lower().replace("_", "")
+                    == function_name.lower().replace("_", "")
+                ):
+                    matched_name = function_name
+                    ref_type = "function"
+                elif class_name and (
+                    ref_id.lower() == class_name.lower()
+                    or ref_id.lower().replace("_", "")
+                    == class_name.lower().replace("_", "")
+                ):
+                    matched_name = class_name
+                    ref_type = "class"
+                elif method_name and (
+                    ref_id.lower() == method_name.lower()
+                    or ref_id.lower().replace("_", "")
+                    == method_name.lower().replace("_", "")
+                ):
+                    matched_name = method_name
+                    ref_type = "method"
+
+                if matched_name:
+
+                    code_snippet = None
+                    start_line = metadata.get("start_line", 0)
+                    end_line = metadata.get("end_line", 0)
+
+                    if start_line and end_line and start_line > 0:
+                        lines = content.split("\n")
+                        if len(lines) >= end_line:
+                            code_snippet = "\n".join(lines[start_line - 1 : end_line])
+
+                    if not code_snippet or len(code_snippet.strip()) < 10:
+                        if ref_type in ["function", "method"]:
+                            func_patterns = [
+                                r"(?:function|const|async\s+function)\s+"
+                                + re.escape(matched_name)
+                                + r"[^{]*\{[^}]*\}",
+                                r"def\s+"
+                                + re.escape(matched_name)
+                                + r"\([^)]*\):.*?(?=\n\s*(?:def|class|\Z))",
+                            ]
+                            for pattern in func_patterns:
+                                match = re.search(
+                                    pattern, content, re.MULTILINE | re.DOTALL
+                                )
+                                if match:
+                                    code_snippet = match.group(0).strip()
+                                    break
+                        elif ref_type == "class":
+                            class_patterns = [
+                                r"class\s+"
+                                + re.escape(matched_name)
+                                + r"[^{]*\{[^}]*\}",
+                                r"class\s+"
+                                + re.escape(matched_name)
+                                + r".*?(?=\n\s*(?:class|def|\Z))",
+                            ]
+                            for pattern in class_patterns:
+                                match = re.search(
+                                    pattern, content, re.MULTILINE | re.DOTALL
+                                )
+                                if match:
+                                    code_snippet = match.group(0).strip()
+                                    break
+
+                    if not code_snippet or len(code_snippet.strip()) < 10:
+                        code_snippet = content[:5000]
+
+                    parameters = []
+                    if ref_type in ["function", "method"]:
+                        sig_patterns = [
+                            r"function\s+"
+                            + re.escape(matched_name)
+                            + r"\s*\(([^)]*)\)",
+                            r"const\s+"
+                            + re.escape(matched_name)
+                            + r"\s*=\s*(?:async\s+)?\(([^)]*)\)",
+                            r"def\s+" + re.escape(matched_name) + r"\s*\(([^)]*)\)",
+                            r"(?:public|private|protected)?\s*(?:async\s+)?"
+                            + re.escape(matched_name)
+                            + r"\s*\(([^)]*)\)",
+                        ]
+
+                        for pattern in sig_patterns:
+                            match = re.search(
+                                pattern, content, re.MULTILINE | re.DOTALL
+                            )
+                            if match:
+                                params_str = match.group(1).strip()
+                                if params_str:
+                                    param_list = []
+                                    current_param = ""
+                                    depth = 0
+                                    for char in params_str:
+                                        if char in "([{":
+                                            depth += 1
+                                        elif char in ")]}":
+                                            depth -= 1
+                                        elif char == "," and depth == 0:
+                                            if current_param.strip():
+                                                param_list.append(current_param.strip())
+                                            current_param = ""
+                                            continue
+                                        current_param += char
+                                    if current_param.strip():
+                                        param_list.append(current_param.strip())
+
+                                    for param in param_list:
+                                        param = param.strip()
+                                        if not param or param in [
+                                            "...",
+                                            "...rest",
+                                            "...args",
+                                        ]:
+                                            continue
+
+                                        param_name = (
+                                            param.split(":")[0]
+                                            .split("=")[0]
+                                            .split("?")[0]
+                                            .strip()
+                                        )
+
+                                        default_value = None
+                                        if "=" in param:
+                                            default_part = param.split("=", 1)[
+                                                1
+                                            ].strip()
+                                            default_part = (
+                                                re.sub(
+                                                    r"^[^=]*=",
+                                                    "",
+                                                    default_part,
+                                                    count=1,
+                                                )
+                                                if ":" in param
+                                                else default_part
+                                            )
+                                            default_value = (
+                                                default_part.split(",")[0].strip()
+                                                if default_part
+                                                else None
+                                            )
+
+                                        if param_name:
+                                            try:
+                                                param_prompt = f"""Given this function parameter from the code:
+
+Parameter: {param_name}
+Full parameter definition: {param}
+Function: {matched_name}
+Code context:
+{content[:2000]}
+
+Generate a clear, documentation-style description for this parameter (1-2 sentences). Describe what the parameter is used for and its purpose in the function. Write it in a professional documentation format, similar to scikit-learn or Python documentation.
+
+Example format:
+"The number of samples to draw from the dataset. Must be greater than 0."
+
+Description:"""
+
+                                                param_response = (
+                                                    llm_service.client.messages.create(
+                                                        model=llm_service.model,
+                                                        max_tokens=150,
+                                                        messages=[
+                                                            {
+                                                                "role": "user",
+                                                                "content": param_prompt,
+                                                            }
+                                                        ],
+                                                    )
+                                                )
+
+                                                if (
+                                                    param_response.content
+                                                    and len(param_response.content) > 0
+                                                ):
+                                                    param_description = (
+                                                        param_response.content[
+                                                            0
+                                                        ].text.strip()
+                                                    )
+                                                    param_description = (
+                                                        param_description.split("\n")[
+                                                            0
+                                                        ].strip()
+                                                    )
+                                                    param_description = (
+                                                        param_description.strip(
+                                                            '"'
+                                                        ).strip("'")
+                                                    )
+                                                else:
+                                                    param_description = f"The {param_name.replace('_', ' ')} parameter."
+                                            except Exception as e:
+                                                param_description = f"The {param_name.replace('_', ' ')} parameter."
+
+                                            parameters.append(
+                                                {
+                                                    "name": param_name,
+                                                    "description": param_description,
+                                                    "default": default_value,
+                                                }
+                                            )
+                                break
+
+                    description = None
+
+                    doc_patterns = [
+                        (r"/\*\*([\s\S]*?)\*/", lambda m: m.group(1)),
+                        (r'"""([\s\S]*?)"""', lambda m: m.group(1)),
+                        (r"'''([\s\S]*?)'''", lambda m: m.group(1)),
+                    ]
+
+                    for pattern, extractor in doc_patterns:
+                        matches = re.findall(pattern, content, re.MULTILINE | re.DOTALL)
+                        if matches:
+                            doc = (
+                                matches[0]
+                                if isinstance(matches[0], str)
+                                else extractor(matches[0]) if matches[0] else ""
+                            )
+                            if doc:
+                                doc = re.sub(r"^\s*\*\s*", "", doc, flags=re.MULTILINE)
+                                doc = doc.strip()
+                                if doc and len(doc) > 20:
+                                    description = doc[:800]
+                                    break
+
+                    if not description or len(description) < 50:
+                        try:
+                            description_prompt = f"""Generate a concise but detailed description for this {ref_type} from the codebase.
+
+{ref_type.capitalize()} name: {matched_name}
+File: {file_path}
+
+Code:
+{content[:2000]}
+Generate a description similar to scikit-learn documentation style. Be specific about what it does, its purpose, and key functionality. Keep it concise but informative (2-4 sentences max).
+
+**CRITICAL INSTRUCTIONS - READ CAREFULLY:**
+1. Do NOT include the {ref_type} name at the beginning. Just describe what it does.
+2. **ABSOLUTELY FORBIDDEN: DO NOT copy ANY text from the code, including:**
+   - Prompt strings (f-strings with instructions like "You are an expert...")
+   - Docstrings or comments
+   - Instruction text
+   - Any string literals
+   - Template text
+3. **YOU MUST: Analyze the FUNCTION'S BEHAVIOR, not its text content:**
+   - What API does it call? (e.g., "calls OpenAI API")
+   - What does it process? (e.g., "processes metadata")
+   - What does it return? (e.g., "returns formatted citations")
+   - What is its purpose? (e.g., "generates academic citations")
+4. **If you see prompt strings in the code, they are DATA the function uses, NOT the function's description.**
+   - Example: If code has `prompt = "You are an expert..."`, DO NOT copy that.
+   - Instead, say: "Generates formatted citations using AI based on metadata"
+5. Write COMPLETELY ORIGINAL descriptions based on code logic analysis, never copy text from code.
+
+Example format (correct):
+"A sequence of data transformers with an optional final predictor. Pipeline allows you to sequentially apply a list of transformers to preprocess the data and, if desired, conclude the sequence with a final predictor for predictive modeling."
+
+Example format (wrong - do NOT do this):
+"Pipeline: A sequence of data transformers..."
+
+Example of what NOT to do (copying prompt strings):
+If the code has: `prompt = "You are an expert..."` - DO NOT copy that prompt. Instead, describe that the function generates citations using AI.
+
+Description:"""
+
+                            llm_response = llm_service.client.messages.create(
+                                model=llm_service.model,
+                                max_tokens=300,
+                                system="You are a technical documentation expert. You analyze code behavior and write original descriptions. You NEVER copy text from code - you analyze what functions DO and describe their purpose and behavior.",
+                                messages=[
+                                    {"role": "user", "content": description_prompt}
+                                ],
+                            )
+
+                            if llm_response.content and len(llm_response.content) > 0:
+                                generated_desc = llm_response.content[0].text.strip()
+                                if generated_desc and len(generated_desc) > 30:
+                                    description = generated_desc
+                        except Exception as e:
+                            print(
+                                f"  ⚠ Failed to generate LLM description for {matched_name}: {e}"
+                            )
+
+                        if not description or len(description) < 30:
+                            if ref_type == "class":
+                                description = "A class that provides functionality for managing operations and state within the application."
+                            elif ref_type == "function":
+                                description = "A function that processes input data and returns transformed output according to its implementation."
+                            else:
+                                description = "A method that performs operations on the class instance."
+
+                    if description:
+                        description = re.sub(
+                            r"^" + re.escape(matched_name) + r"[:\s]+",
+                            "",
+                            description,
+                            flags=re.IGNORECASE,
+                        )
+                        description = re.sub(
+                            r"^" + re.escape(matched_name) + r"\s+is\s+",
+                            "",
+                            description,
+                            flags=re.IGNORECASE,
+                        )
+                        description = description.strip()
+
+                    module_path = (
+                        file_path.replace("\\", "/").rsplit("/", 1)[0]
+                        if "/" in file_path or "\\" in file_path
+                        else None
+                    )
+                    signature_parts = []
+
+                    if module_path:
+                        module_path = (
+                            module_path.replace("app/", "")
+                            .replace("src/", "")
+                            .replace("lib/", "")
+                        )
+                        signature_parts.append(module_path.replace("/", "."))
+
+                    signature_parts.append(matched_name)
+
+                    param_strings = []
+                    if parameters:
+                        for param in parameters:
+                            param_name = param.get("name", "")
+                            default_val = param.get("default")
+
+                            if default_val:
+                                param_strings.append(f"{param_name}={default_val}")
+                            else:
+                                if (
+                                    "id" in param_name.lower()
+                                    or "key" in param_name.lower()
+                                ):
+                                    sample_val = "'example_id'"
+                                elif (
+                                    "data" in param_name.lower()
+                                    or "input" in param_name.lower()
+                                ):
+                                    sample_val = "data"
+                                elif (
+                                    "config" in param_name.lower()
+                                    or "options" in param_name.lower()
+                                ):
+                                    sample_val = "None"
+                                elif (
+                                    "callback" in param_name.lower()
+                                    or "handler" in param_name.lower()
+                                ):
+                                    sample_val = "callback"
+                                elif (
+                                    "count" in param_name.lower()
+                                    or "num" in param_name.lower()
+                                    or "size" in param_name.lower()
+                                ):
+                                    sample_val = "5"
+                                elif (
+                                    "flag" in param_name.lower()
+                                    or "enable" in param_name.lower()
+                                    or "is_" in param_name.lower()
+                                ):
+                                    sample_val = "True"
+                                else:
+                                    sample_val = "None"
+
+                                param_strings.append(f"{param_name}={sample_val}")
+
+                    signature_str = ".".join(signature_parts)
+                    if param_strings:
+                        signature_str += f"({', '.join(param_strings)})"
+                    else:
+                        signature_str += "()"
+
+                    code_reference_details.append(
+                        {
+                            "referenceId": ref_id,
+                            "name": matched_name,
+                            "type": ref_type,
+                            "description": description,
+                            "filePath": file_path,
+                            "module": (
+                                file_path.replace("\\", "/").rsplit("/", 1)[0]
+                                if "/" in file_path or "\\" in file_path
+                                else None
+                            ),
+                            "parameters": parameters if parameters else None,
+                            "code": code_snippet,
+                            "signature": signature_str,
+                        }
+                    )
+                    matched = True
+                    break
+
+            if not matched:
+
+                found_context = None
+                found_file = None
+                for chunk in search_results:
+                    content = chunk.get("content", "")
+                    metadata = chunk.get("metadata", {})
+                    file_path = metadata.get("file_path", "")
+
+                    if ref_id in content or ref_id.replace("_", "") in content.replace(
+                        "_", ""
+                    ):
+
+                        lines = content.split("\n")
+                        for i, line in enumerate(lines):
+                            if ref_id in line or ref_id.replace(
+                                "_", ""
+                            ) in line.replace("_", ""):
+
+                                start = max(0, i - 5)
+                                end = min(len(lines), i + 6)
+                                found_context = "\n".join(lines[start:end])
+                                found_file = file_path
+                                break
+                        if found_context:
+                            break
+
+                description = None
+                if found_context:
+                    try:
+
+                        doc_context = ""
+                        for section in documentation.get("sections", []):
+                            desc = section.get("description", "")
+                            if f"[[{ref_id}]]" in desc or ref_id in desc:
+
+                                sentences = desc.split(".")
+                                for sent in sentences:
+                                    if ref_id in sent or f"[[{ref_id}]]" in sent:
+                                        doc_context = sent.strip()
+                                        break
+                                if doc_context:
+                                    break
+
+                        description_prompt = f"""Generate a concise but detailed description for this code reference: {ref_id}
+
+Code context where it appears:
+{found_context[:1500]}
+
+Documentation context (how it's described):
+{doc_context if doc_context else "Not mentioned in documentation"}
+
+Based on the code context and how it's used, describe what this code element does. Be specific about:
+- What it is (function, class, module, instance, etc.)
+- What it does or what it's used for
+- Key functionality based on the code context
+
+Keep it to 2-3 sentences. Write in scikit-learn documentation style.
+
+**CRITICAL**: 
+- If it's an import (like `from X import Y` or `import X`), describe what the imported module/function does
+- If it's an instance (like `model = SomeModel()`), describe what the instance is used for
+- If it's a library function (like `util.cos_sim`), describe what the library function does
+- Analyze the code context to understand its purpose, don't just say "a code element"
+
+Description:"""
+
+                        llm_response = llm_service.client.messages.create(
+                            model=llm_service.model_fast,
+                            max_tokens=200,
+                            system="You are a technical documentation expert. Analyze code context and write specific, helpful descriptions.",
+                            messages=[{"role": "user", "content": description_prompt}],
+                        )
+
+                        if llm_response.content and len(llm_response.content) > 0:
+                            generated_desc = llm_response.content[0].text.strip()
+                            if generated_desc and len(generated_desc) > 30:
+                                description = generated_desc
+                    except Exception as e:
+                        print(
+                            f"  ⚠ Failed to generate description for unmatched reference {ref_id}: {e}"
+                        )
+
+                if not description or len(description) < 30:
+
+                    name_lower = ref_id.lower()
+                    if "model" in name_lower:
+                        if "sbert" in name_lower or "bert" in name_lower:
+                            description = "A Sentence-BERT model instance used for generating sentence embeddings and computing semantic similarity between text."
+                        elif "kw" in name_lower or "keyword" in name_lower:
+                            description = "A keyword extraction model instance used for extracting relevant keywords and keyphrases from text."
+                        else:
+                            description = f"A model instance ({ref_id}) used for processing and analyzing data."
+                    elif "nlp" in name_lower:
+                        description = "A natural language processing pipeline instance (likely spaCy) used for text analysis, tokenization, and linguistic feature extraction."
+                    elif (
+                        "util" in name_lower
+                        or "cos" in name_lower
+                        or "sim" in name_lower
+                    ):
+                        description = "A utility function for computing cosine similarity between vectors, typically used for measuring semantic similarity between text embeddings."
+                    elif "client" in name_lower and "chat" in name_lower:
+                        description = "An OpenAI API client method for creating chat completions, used to interact with GPT models for text generation and analysis."
+                    elif (
+                        "get_" in name_lower
+                        or "fetch_" in name_lower
+                        or "retrieve_" in name_lower
+                    ):
+                        description = f"A function ({ref_id}) that retrieves or fetches data from a source."
+                    elif "generate_" in name_lower or "create_" in name_lower:
+                        description = f"A function ({ref_id}) that generates or creates new content or data."
+                    elif "process_" in name_lower or "handle_" in name_lower:
+                        description = f"A function ({ref_id}) that processes or handles input data."
+                    else:
+                        description = f"A code element ({ref_id}) that performs operations as defined in the codebase."
+
+                code_reference_details.append(
+                    {
+                        "referenceId": ref_id,
+                        "name": ref_id,
+                        "type": "function",
+                        "description": description,
+                        "filePath": found_file,
+                        "module": (
+                            found_file.replace("\\", "/").rsplit("/", 1)[0]
+                            if found_file and ("/" in found_file or "\\" in found_file)
+                            else None
+                        ),
+                        "parameters": None,
+                        "code": found_context[:2000] if found_context else None,
+                    }
+                )
+
+        doc_length = len(json.dumps(documentation))
+        print(f"✓ Documentation generated ({doc_length} characters)")
+        print(f"✓ Sections: {len(documentation.get('sections', []))}")
+        print(f"✓ Code references: {len(code_reference_ids_from_llm)}")
+
+        def extract_title(doc_data: dict, prompt: str) -> str:
+
+            sections = doc_data.get("sections", [])
+            if sections and len(sections) > 0:
+                first_section = sections[0]
+                title = first_section.get("title", "")
+                if title and len(title) > 0 and len(title) <= 100:
+                    return title
+
+            if sections and len(sections) > 0:
+                first_section = sections[0]
+                description = first_section.get("description", "").strip()
+                if description:
+                    sentences = re.split(r"[.!?]\s+", description)
+                    if sentences and sentences[0]:
+                        title = sentences[0].strip()
+                        if len(title) > 0:
+                            return title[:100]
+
+            if prompt:
+                title = prompt[:60].strip()
+                if len(title) < len(prompt):
+                    title += "..."
+                return title
+
+            return "Documentation"
+
+        doc_title = (
+            arch_result.get("title", "System Architecture")
+            if arch_result is not None
+            else extract_title(documentation, request.prompt)
+        )
+        doc_description = documentation.get("description", "").strip()
+        print(f"✓ Extracted title: {doc_title}")
+        if doc_description:
+            print(f"✓ Extracted description: {doc_description[:100]}...")
+
+        code_reference_ids = []
+
+        if mongodb_service and request.organization_id and request.repository_id:
+            print(f"\n[Step 8/10] Upserting code references to MongoDB...")
+
+            for ref in code_reference_details:
+                ref_id = ref.get("referenceId")
+                if not ref_id:
+                    continue
+
+                result = mongodb_service.upsert_code_reference(
+                    organization_id=request.organization_id,
+                    repository_id=request.repository_id,
+                    reference_id=ref_id,
+                    name=ref.get("name", ""),
+                    reference_type=ref.get("type", "function"),
+                    description=ref.get("description", ""),
+                    module=ref.get("module"),
+                    file_path=ref.get("filePath"),
+                    signature=ref.get("signature"),
+                    parameters=ref.get("parameters"),
+                    returns=ref.get("returns"),
+                    examples=ref.get("examples"),
+                    see_also=ref.get("seeAlso"),
+                    code=ref.get("code"),
+                )
+
+                if result.get("success"):
+                    if ref_id not in code_reference_ids:
+                        code_reference_ids.append(ref_id)
+                    action = result.get("action", "unknown")
+                    print(f"  ✓ Code reference '{ref_id}': {action}")
+                else:
+                    print(
+                        f"  ⚠ Failed to upsert code reference '{ref_id}': {result.get('error')}"
+                    )
+
+            for ref_id in code_reference_ids_from_llm:
+                if ref_id not in code_reference_ids:
+                    code_reference_ids.append(ref_id)
+                    if ref_id not in [
+                        r.get("referenceId") for r in code_reference_details
+                    ]:
+                        print(
+                            f"  ⚠ Code reference ID '{ref_id}' has no details - will not be stored in MongoDB"
+                        )
+
+            print(f"✓ Upserted {len(code_reference_ids)} code references")
+        else:
+            if not mongodb_service:
+                print(
+                    f"\n[Step 8/10] MongoDB service not available, skipping code references"
+                )
+            else:
+                print(
+                    f"\n[Step 8/10] Missing organization_id or repository_id, skipping MongoDB upsert"
+                )
+
+        if getattr(request, "documentation_type", None) == "architecture":
+            print(
+                f"\n[Step 8b/10] Generating section diagrams (architecture: flowcharts + class diagram for Components)..."
+            )
+            _enrich_architecture_diagrams(
+                documentation,
+                llm_service,
+                context_chunks=search_results,
+                repo_name=request.repo_full_name,
+            )
+
+        print(f"\n[Step 9/10] Saving documentation to local storage...")
+        doc_metadata = {
+            "collection_name": collection_name,
+            "chunks_used": len(search_results),
+            "file_paths": file_paths,
+            "chunks": [
+                {
+                    "file_path": chunk.get("metadata", {}).get("file_path", ""),
+                    "function_name": chunk.get("metadata", {}).get("function_name", ""),
+                    "score": chunk.get("score", 0),
+                }
+                for chunk in search_results
+            ],
+        }
+
+        def documentation_to_markdown(doc_data: dict) -> str:
+
+            markdown_parts = []
+            sections = doc_data.get("sections", [])
+
+            def process_section(section, level=1):
+                section_id = section.get("id", "")
+                title = section.get("title", "")
+                description = section.get("description", "")
+                code_refs = section.get("code_references", [])
+                subsections = section.get("subsections", [])
+
+                if title:
+                    markdown_parts.append(f"{'#' * level} {section_id}. {title}\n")
+
+                if description:
+                    markdown_parts.append(description + "\n\n")
+
+                if code_refs:
+                    markdown_parts.append(
+                        "**Code References:** "
+                        + ", ".join([f"`{ref}`" for ref in code_refs])
+                        + "\n\n"
+                    )
+
+                for subsection in subsections:
+                    process_section(subsection, level + 1)
+
+            for section in sections:
+                process_section(section)
+
+            return "\n".join(markdown_parts)
+
+        documentation_markdown = documentation_to_markdown(documentation)
+
+        doc_saved_paths = storage_service.save_documentation(
+            repo_full_name=request.repo_full_name,
+            branch=branch,
+            prompt=request.prompt,
+            documentation=documentation_markdown,
+            metadata=doc_metadata,
+        )
+
+        print(f"✓ Documentation saved to: {doc_saved_paths['documentation_file']}")
+
+        s3_result = None
+        s3_key = None
+        if s3_service:
+            print(f"\n[Step 10/10] Uploading documentation to S3...")
+
+            if not request.organization_id or not request.repository_id:
+                print("⚠ Missing organization_id or repository_id, skipping S3 upload")
+            else:
+                doc_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                s3_key = s3_service.generate_s3_key(
+                    organization_id=request.organization_id,
+                    repository_id=request.repository_id,
+                    branch=branch,
+                    scope="custom",
+                    documentation_id=doc_id,
+                    file_extension="json",
+                )
+
+                documentation_json = {
+                    "version": "1.0",
+                    "metadata": {
+                        "title": doc_title,
+                        "generated_at": datetime.now().isoformat(),
+                        "prompt": request.prompt,
+                        "repository": request.repo_full_name,
+                        "branch": branch,
+                        "scope": "custom",
+                        "documentation_type": getattr(
+                            request, "documentation_type", None
+                        ),
+                        "ai_agent_doc_kind": getattr(
+                            request, "ai_agent_doc_kind", None
+                        ),
+                    },
+                    "documentation": documentation,
+                    "code_references": code_reference_ids,
+                    "file_paths": file_paths,
+                }
+
+                documentation_json_str = json.dumps(documentation_json, indent=2)
+
+                s3_result = s3_service.upload_documentation(
+                    content=documentation_json_str,
+                    s3_key=s3_key,
+                    content_type="application/json",
+                )
+
+                if s3_result.get("success"):
+                    print(f"✓ Documentation uploaded to S3: {s3_result['s3_key']}")
+                    print(f"  Size: {s3_result['content_size']} bytes")
+
+                else:
+                    print(f"⚠ S3 upload failed: {s3_result.get('error')}")
+        else:
+            print(f"\n[Step 10/10] S3 service not available, skipping S3 upload")
+
+        print("=" * 60 + "\n")
+
+        result = {
+            "success": True,
+            "prompt": request.prompt,
+            "title": doc_title,
+            "description": doc_description if doc_description else None,
+            "repository": request.repo_full_name,
+            "branch": branch,
+            "collection_name": collection_name,
+            "chunks_used": len(search_results),
+            "metadata": index_metadata,
+            "saved_paths": doc_saved_paths,
+            "chunks": doc_metadata["chunks"],
+            "code_reference_ids": code_reference_ids,
+            "file_paths": file_paths,
+        }
+
+        if s3_result and s3_result.get("success"):
+            result["s3"] = {
+                "s3_key": s3_result["s3_key"],
+                "s3_bucket": s3_service.bucket_name,
+                "s3_url": s3_result["s3_url"],
+                "content_size": s3_result["content_size"],
+            }
+
+            result["documentation_type"] = getattr(request, "documentation_type", None)
+            result["ai_agent_doc_kind"] = getattr(request, "ai_agent_doc_kind", None)
+        else:
+            result["documentation"] = documentation
+
+        return result
+
+    except HTTPException as e:
+        print(f"[ERROR] RAG generation failed: {e.detail}")
+        raise e
+    except Exception as e:
+        print(f"[ERROR] RAG generation failed: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate documentation: {str(e)}"
+        )
+
+
+@router.post("/api/get-documentation")
+async def get_documentation(request: GetDocumentationRequest):
+
+    if s3_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 service not initialized. Please set AWS credentials in environment variables.",
+        )
+
+    try:
+
+        bucket = request.s3_bucket or s3_service.bucket_name
+
+        result = s3_service.get_documentation(request.s3_key)
+
+        if result.get("success"):
+            return {
+                "success": True,
+                "content": result["content"],
+                "content_type": result.get("content_type", "application/json"),
+                "content_size": result.get("content_size", 0),
+                "last_modified": result.get("last_modified"),
+            }
+        else:
+            raise HTTPException(
+                status_code=404, detail=result.get("error", "Documentation not found")
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to retrieve documentation: {str(e)}"
+        )
+
+
+def _uml_slug_from_prompt(prompt: str, diagram_type: str = "class") -> str:
+
+    raw = (prompt or "").strip()[:60]
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "diagram"
+    return f"{diagram_type}-{slug}"
+
+
+def _uml_diagram_summary(diagram_type: str, diagram_data: Dict[str, Any]) -> str:
+
+    if diagram_type == "class":
+        classes = diagram_data.get("classes") or []
+        rels = diagram_data.get("relationships") or []
+        class_names = [
+            c.get("className") or c.get("id") or ""
+            for c in classes
+            if isinstance(c, dict)
+        ]
+        return f"Classes: {', '.join(filter(None, class_names))}. Relationships: {len(rels)}."
+    if diagram_type == "sequence":
+        lifelines = diagram_data.get("lifelines") or []
+        messages = diagram_data.get("messages") or []
+        lifeline_names = [
+            l.get("name") or l.get("id") or "" for l in lifelines if isinstance(l, dict)
+        ]
+        return f"Lifelines: {', '.join(filter(None, lifeline_names))}. Messages: {len(messages)}."
+    if diagram_type == "use_case":
+        actors = diagram_data.get("actors") or []
+        use_cases = diagram_data.get("useCases") or []
+        actor_names = [
+            a.get("name") or a.get("id") or "" for a in actors if isinstance(a, dict)
+        ]
+        uc_names = [
+            u.get("name") or u.get("id") or "" for u in use_cases if isinstance(u, dict)
+        ]
+        return f"Actors: {', '.join(filter(None, actor_names))}. Use cases: {', '.join(filter(None, uc_names))}."
+    if diagram_type == "state":
+        states = diagram_data.get("states") or []
+        transitions = diagram_data.get("transitions") or []
+        state_names = [
+            s.get("label") or s.get("id") or "" for s in states if isinstance(s, dict)
+        ]
+        return f"States: {', '.join(filter(None, state_names))}. Transitions: {len(transitions)}."
+    return "UML diagram."
+
+
+def _uml_unique_slug_from_title(
+    title: str, diagram_type: str, existing_slugs: List[str]
+) -> str:
+
+    raw = (title or "").strip()[:80]
+    base = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "diagram"
+    base = f"{diagram_type}-{base}" if not base.startswith(diagram_type) else base
+    existing_set = set(existing_slugs or [])
+    slug = base
+    n = 2
+    while slug in existing_set:
+        slug = f"{base}-{n}"
+        n += 1
+    return slug
+
+
+def _log_rag(msg: str) -> None:
+
+    print(msg, flush=True)
+
+
+@router.post("/api/generate-uml")
+async def generate_uml(request: GenerateUmlRequest):
+
+    if not llm_service:
+        raise HTTPException(
+            status_code=500,
+            detail="LLM service not available. Set ANTHROPIC_API_KEY.",
+        )
+    if not request.organization_short_id or not request.repository_name:
+        raise HTTPException(
+            status_code=400,
+            detail="organization_short_id and repository_name are required",
+        )
+
+    diagram_type = (request.diagram_type or "class").lower()
+    if diagram_type == "usecase":
+        diagram_type = "use_case"
+    _log_rag("")
+    _log_rag("=" * 60)
+    _log_rag(f"RAG UML GENERATION ({diagram_type.upper()} DIAGRAM)")
+    _log_rag("=" * 60)
+    _log_rag(f"Repository: {request.repo_full_name}")
+    _log_rag(f"Prompt: {request.prompt}")
+    _log_rag("=" * 60)
+
+    branch = request.branch or "main"
+    if not branch.strip() or branch.strip().lower() in ("main", "master"):
+        try:
+            resolved = await github_fetcher.get_default_branch(
+                request.repo_full_name, request.github_token
+            )
+            if resolved:
+                branch = resolved
+                _log_rag(f"[generate-uml] Using repo default branch: {branch}")
+        except Exception:
+            pass
+
+    collection_name = build_collection_name(
+        request.organization_name,
+        request.organization_short_id,
+        request.repository_name,
+        branch,
+    )
+    existing_count = vectorizer.vector_db.get_collection_count(collection_name)
+
+    if existing_count > 0:
+        _log_rag(
+            f"\n[Skip] Collection '{collection_name}' exists ({existing_count} chunks). Retrieving only."
+        )
+        result = {
+            "success": True,
+            "branch": branch,
+            "metadata": {"totalChunks": existing_count},
+            "vectorization": {"success": True, "collection_name": collection_name},
+        }
+    else:
+        _log_rag(
+            "\n[Step 1–5/7] Running index pipeline (fetch → parse → chunk → save → vectorize)..."
+        )
+        result = await run_index_pipeline(
+            github_token=request.github_token,
+            repo_full_name=request.repo_full_name,
+            branch=branch,
+            target=None,
+            organization_id=request.organization_id,
+            organization_short_id=request.organization_short_id,
+            organization_name=request.organization_name,
+            repository_id=request.repository_id,
+            repository_name=request.repository_name,
+        )
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=(
+                    400 if "required" in str(result.get("message", "")).lower() else 500
+                ),
+                detail=result.get("message", "Index pipeline failed"),
+            )
+        vectorization = result.get("vectorization")
+        if not vectorization or not vectorization.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail="Vectorization failed.",
+            )
+        collection_name = vectorization["collection_name"]
+        branch = result.get("branch", branch)
+        _log_rag("✓ Index pipeline complete.")
+
+    _log_rag(f"\n[Step 6/7] Searching vector DB for relevant chunks...")
+    _log_rag(f"Query: {request.prompt}")
+
+    search_results = vectorizer.search(
+        collection_name=collection_name,
+        query=request.prompt,
+        top_k=request.top_k or 20,
+    )
+    if not search_results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No chunks found in collection '{collection_name}'",
+        )
+    _log_rag(f"✓ Found {len(search_results)} relevant chunks")
+
+    _uml_file_paths = sorted(
+        set(
+            (c.get("metadata") or {}).get("file_path", "").strip()
+            for c in search_results
+        )
+    )
+    uml_file_paths = [p for p in _uml_file_paths if p]
+
+    if diagram_type not in ("class", "sequence", "use_case", "state"):
+        raise HTTPException(
+            status_code=400,
+            detail="diagram_type must be 'class', 'sequence', 'use_case', or 'state'.",
+        )
+
+    if diagram_type == "class":
+        _log_rag(f"\n[Step 7/7] Generating UML class diagram with Claude...")
+        uml_result = llm_service.generate_uml_class_diagram(
+            prompt=request.prompt,
+            context_chunks=search_results,
+            repo_name=request.repository_name or request.repo_full_name,
+        )
+        if uml_result.get("error"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"UML generation failed: {uml_result.get('error')}",
+            )
+        classes = uml_result.get("classes") or []
+        relationships = uml_result.get("relationships") or []
+        _log_rag(
+            f"✓ Generated {len(classes)} classes, {len(relationships)} relationships"
+        )
+        diagram_data = {"classes": classes, "relationships": relationships}
+    elif diagram_type == "sequence":
+        _log_rag(f"\n[Step 7/7] Generating UML sequence diagram with Claude...")
+        uml_result = llm_service.generate_uml_sequence_diagram(
+            prompt=request.prompt,
+            context_chunks=search_results,
+            repo_name=request.repository_name or request.repo_full_name,
+        )
+        if uml_result.get("error"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"UML generation failed: {uml_result.get('error')}",
+            )
+        lifelines = uml_result.get("lifelines") or []
+        messages = uml_result.get("messages") or []
+        steps = uml_result.get("steps") or []
+        fragments = uml_result.get("fragments") or []
+        _log_rag(
+            f"✓ Generated {len(lifelines)} lifelines, {len(messages)} messages, {len(steps)} steps"
+        )
+        diagram_data = {
+            "lifelines": lifelines,
+            "messages": messages,
+            "steps": steps,
+            "fragments": fragments,
+        }
+    elif diagram_type == "use_case":
+        _log_rag(f"\n[Step 7/7] Generating UML use case diagram with Claude...")
+        uml_result = llm_service.generate_uml_use_case_diagram(
+            prompt=request.prompt,
+            context_chunks=search_results,
+            repo_name=request.repository_name or request.repo_full_name,
+        )
+        if uml_result.get("error"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"UML generation failed: {uml_result.get('error')}",
+            )
+        system_boundary = uml_result.get("systemBoundary") or {}
+        actors = uml_result.get("actors") or []
+        use_cases = uml_result.get("useCases") or []
+        relationships = uml_result.get("relationships") or []
+        _log_rag(
+            f"✓ Generated use case diagram: {len(actors)} actors, {len(use_cases)} use cases, {len(relationships)} relationships"
+        )
+        diagram_data = {
+            "systemBoundary": system_boundary,
+            "actors": actors,
+            "useCases": use_cases,
+            "relationships": relationships,
+        }
+    elif diagram_type == "state":
+        _log_rag(f"\n[Step 7/7] Generating UML state diagram with Claude...")
+        uml_result = llm_service.generate_uml_state_diagram(
+            prompt=request.prompt,
+            context_chunks=search_results,
+            repo_name=request.repository_name or request.repo_full_name,
+        )
+        if uml_result.get("error"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"UML generation failed: {uml_result.get('error')}",
+            )
+        initial_states = uml_result.get("initialStates") or []
+        final_states = uml_result.get("finalStates") or []
+        states = uml_result.get("states") or []
+        composite_states = uml_result.get("compositeStates") or []
+        transitions = uml_result.get("transitions") or []
+        _log_rag(
+            f"✓ Generated state diagram: {len(states)} states, {len(composite_states)} composites, {len(transitions)} transitions"
+        )
+        diagram_data = {
+            "initialStates": initial_states,
+            "finalStates": final_states,
+            "states": states,
+            "compositeStates": composite_states,
+            "transitions": transitions,
+        }
+
+    repo_name = request.repository_name or request.repo_full_name or "repository"
+    existing_list: List[Dict[str, str]] = []
+    existing_slugs: List[str] = []
+    if mongodb_service and request.repository_id:
+        existing = mongodb_service.get_existing_uml_titles_descriptions(
+            request.repository_id
+        )
+        if existing.get("success") and existing.get("titles_descriptions"):
+            existing_list = [
+                {"name": x.get("name") or "", "description": x.get("description") or ""}
+                for x in existing["titles_descriptions"]
+            ]
+            existing_slugs = [
+                x.get("slug") or ""
+                for x in existing["titles_descriptions"]
+                if x.get("slug")
+            ]
+
+    diagram_summary = _uml_diagram_summary(diagram_type, diagram_data)
+    title_desc_result = llm_service.generate_uml_title_and_description(
+        prompt=request.prompt,
+        diagram_type=diagram_type,
+        diagram_summary=diagram_summary,
+        existing_titles_descriptions=existing_list,
+        repo_name=repo_name,
+    )
+    if title_desc_result.get("error"):
+        _log_rag(
+            f"⚠ LLM title/description failed, using fallback: {title_desc_result.get('error')}"
+        )
+        name = _uml_slug_from_prompt(request.prompt, diagram_type)
+        description = None
+    else:
+        name = (title_desc_result.get("title") or "").strip() or _uml_slug_from_prompt(
+            request.prompt, diagram_type
+        )
+        description = (title_desc_result.get("description") or "").strip() or None
+    slug = _uml_unique_slug_from_title(name, diagram_type, existing_slugs)
+
+    if mongodb_service and request.organization_id and request.repository_id:
+        _log_rag("\n[Save] Saving diagram to MongoDB (uml_diagrams)...")
+
+    s3_key = None
+    if s3_service and request.organization_id and request.repository_id:
+        _log_rag("\n[Backup] Uploading diagram JSON to S3...")
+        s3_key = (
+            f"organizations/{request.organization_id}/"
+            f"repositories/{request.repository_id}/uml/{branch.replace('/', '_')}/{slug}.json"
+        )
+        payload = {**diagram_data, "file_paths": uml_file_paths}
+        upload_result = s3_service.upload_documentation(
+            content=json.dumps(payload),
+            s3_key=s3_key,
+            content_type="application/json",
+        )
+        if upload_result.get("success"):
+            _log_rag(f"✓ Diagram uploaded to S3: {s3_key}")
+        else:
+            _log_rag(f"⚠ S3 UML upload failed: {upload_result.get('error')}")
+
+    if not mongodb_service or not request.organization_id or not request.repository_id:
+        raise HTTPException(
+            status_code=500,
+            detail="MongoDB and organization_id/repository_id are required to save the diagram.",
+        )
+
+    insert_result = mongodb_service.insert_uml_diagram(
+        organization_id=request.organization_id,
+        repository_id=request.repository_id,
+        diagram_type=diagram_type,
+        name=name,
+        slug=slug,
+        prompt=request.prompt,
+        diagram_data=diagram_data,
+        s3_key=s3_key,
+        file_paths=uml_file_paths,
+        branch=branch,
+        description=description,
+    )
+    if not insert_result.get("success"):
+        raise HTTPException(
+            status_code=500,
+            detail=insert_result.get("error", "Failed to save diagram to MongoDB"),
+        )
+    _log_rag(f"✓ Diagram saved to MongoDB (slug: {slug})")
+    _log_rag("=" * 60)
+    _log_rag("")
+
+    return {
+        "success": True,
+        "diagramId": insert_result.get("diagram_id"),
+        "slug": slug,
+        "name": name,
+        "description": description,
+        "s3Key": s3_key,
+        "branch": branch,
+    }
+
+
+@router.get("/api/uml-diagram")
+async def get_uml_diagram(
+    organization_id: Optional[str] = None,
+    repository_id: Optional[str] = None,
+    slug: Optional[str] = None,
+    diagram_id: Optional[str] = None,
+):
+
+    if mongodb_service is None:
+        raise HTTPException(status_code=503, detail="MongoDB service not available.")
+
+    if diagram_id:
+        result = mongodb_service.get_uml_diagram_by_id(diagram_id)
+    elif organization_id and repository_id and slug:
+        result = mongodb_service.get_uml_diagram_by_slug(
+            organization_id=organization_id,
+            repository_id=repository_id,
+            slug=slug,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either diagram_id or (organization_id, repository_id, slug).",
+        )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("error", "Diagram not found"),
+        )
+    return {"success": True, "diagram": result["diagram"]}

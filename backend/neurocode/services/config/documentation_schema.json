@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "required": ["documentation", "code_references"],
+  "properties": {
+    "documentation": {
+      "type": "object",
+      "required": ["description", "sections"],
+      "description": "Main documentation with hierarchical sections",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Brief description (2-3 sentences) of what this documentation is about"
+        },
+        "sections": {
+          "type": "array",
+          "description": "Array of documentation sections with hierarchical numbering (1, 1.1, 2, 2.1, etc.). Maximum 10 sections total.",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "description"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Section ID (e.g., '1', '1.1', '2', '2.1', '2.2')"
+              },
+              "title": {
+                "type": "string",
+                "description": "Section title"
+              },
+              "description": {
+                "type": "string",
+                "description": "Description/content for this section"
+              },
+              "code_references": {
+                "type": "array",
+                "description": "Array of code reference IDs mentioned in this section (must match IDs in code_references array)",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "subsections": {
+                "type": "array",
+                "description": "Optional array of subsections (same structure as sections)",
+                "items": {
+                  "$ref": "#/properties/documentation/properties/sections/items"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "code_references": {
+      "type": "array",
+      "description": "Array of code reference IDs (referenceId strings) ONLY. Maximum 15 references. Must be actual unique classes, functions, methods from the code (not generic names like 'useEffect'). Simple array like ['processCitation', 'formatCitation']. Full details will be extracted and stored in MongoDB separately.",
+      "maxItems": 15,
+      "items": {
+        "type": "string"
+      }
+    },
+    "file_paths": {
+      "type": "array",
+      "description": "All file paths from chunks used in generation (populated by backend from embedding metadata; used for sync/affected-files tracking).",
+      "items": { "type": "string" }
+    }
+  }
+}
