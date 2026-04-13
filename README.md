@@ -1,5 +1,7 @@
 # NeuroCode
 
+![NeuroCode Full Logo](./frontend/public/Full-logo.png)
+
 ## Project Overview
 
 **NeuroCode** connects to your team’s repositories and turns a live codebase into a navigable system. It helps you explain and onboard without reading every file. It provides structural maps of component relationships, documentation and guided paths tied to the actual tree, and workflows that highlight risky or high-churn areas.
